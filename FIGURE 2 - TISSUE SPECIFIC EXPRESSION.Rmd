@@ -1,0 +1,332 @@
+---
+title: "TISSUE.SPECFIC.EXPRESSION"
+author: "Connor O'Meara"
+date: "3/24/2020"
+output: html_document
+---
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+setwd("/Users/omeara/Desktop/R.wrk.dir/Tissue expression/")
+library(dplyr)
+library(readxl)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+library(FactoMineR)
+library(factoextra)
+library(KEGGREST)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(gplots)
+library(dplyr)
+
+#ENU genes
+cand <- read_excel("Candidates")
+#Zebrafish gene annotation
+zf_genes <- read_excel("zf_genes")
+#Mouse gene annotation
+mouse_zf_ID <- read_excel("Mouse.zebrafish.ids")
+#Probe annotation
+MOE430_Probe_A <- read_csv("Probe A")
+MOE430_Probe_B <- read_csv("Probe B")
+#Import RAW BIOGPS dataset and join with annotation (MOE430)
+MOE430.raw <- read_csv("MOE430.raw")
+#Import RAW BIOGPS dataset and join with annotation (GNF1M)
+GNF1M.raw <- read_excel("GNF1M.raw")
+```
+
+############################################################################################
+# IMPORT MOE430 AND GNF1M MOUSE BIOGPS MICROARRAY DATASET AND PREPROCESS
+############################################################################################
+
+### 1. FROM MOE430 and GNF1M mouse bioGPS microarray datasets,
+### 2. USE probe annotation and aggregate, to
+### 3. GET the mean expression for each gene of each tissue.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#COMBINE PROBE ANNOTATION WITH INTENSITY DATA
+  colnames(MOE430_Probe_A)[3]<-"PROBE"
+  colnames(MOE430_Probe_B)[3]<-"PROBE"
+  PROBE.anno<-unique(rbind.data.frame(MOE430_Probe_A, MOE430_Probe_B))
+  colnames(PROBE.anno)[1:2]<-c("ID", "GENE")
+  colnames(MOE430.raw)[1]<-"PROBE"
+  MOE430.raw<-inner_join(PROBE.anno, MOE430.raw, by="PROBE")
+
+#REMOVE CELL LINES AND TISSUE WITH HIGH DENSITY OF IMMUNE CELLS
+  cell.lines.rm<-c("C2C12","C3H_10T1_2","RAW_264_7","mIMCD-3","embryonic_stem_line_Bruce4_p13", "embryonic_stem_line_V26_2_p16", "mIMCD-3","min6","neuro2a","nih_3T3", "nih 3T3","3T3-L1","M-1","c2c12...18","c2c12...19","Baf3", "neuro2a", "intestine","liver","lymph_nodes","spleen","kidney")
+  MOE430.raw<-MOE430.raw[,!colnames(MOE430.raw) %in% cell.lines.rm]
+  GNF1M.raw<-GNF1M.raw[,!colnames(GNF1M.raw) %in% cell.lines.rm]
+
+#COMBINE MOE430 AND GNF1M
+  BIOGPS.df<-inner_join(MOE430.raw[,-3], GNF1M.raw[,-1], by="GENE")
+
+#AGGREGATE DATA FOR SAME GENE FINDING THE MEAN INTENSITY
+  BIOGPS.df<-aggregate(BIOGPS.df[,-1], by=list(BIOGPS.df$GENE), FUN=mean, drop = FALSE)
+  BIOGPS.df<-BIOGPS.df[,-2]
+  colnames(BIOGPS.df)[1]<-"GENE"
+```
+
+############################################################################################
+# CALCULATE EXPRESSION BIAS OF GENES TO TISSUE TYPE
+############################################################################################
+
+### 1. FROM the combined bioGPS microarray datasets,
+### 2. USE data partitioned into non-immune, immune, non-T-immune and T cell tissue type, to
+### 3. GET log2 fold change for each gene between tissue partitions.
+
+```{r}
+#NON-IMMUNE TISSUE PARTITION
+  NI<-colnames(BIOGPS.df)[grep(colnames(BIOGPS.df),pattern = "MEF|adipose|adrenal|amygdala|bladder|bone|cerebellum|cerebral|ciliary|cornea|dorsal|epidermis|eyecup|heart|hippocampus|hypothalamus|intestine|iris|lacrimal|lens|lung|nucleus|olfactory|osteo|ovary|pancreas|pituitary|placenta|prostate|retina|gland|skeleta|spinal|stomach|testis|cord|uterus|septal|septum|dorsal|cortex|nasal|thyroid|trigeminal|spinal|trigeminal|fat|mammary|embryo|fertilized|oocyte|cysts|digits|epidermis|tongue|trachea|preoptic")]
+  NI.df<-BIOGPS.df[,colnames(BIOGPS.df) %in% NI]
+  NI.means<-rowMeans(NI.df,na.rm = TRUE)
+
+#IMMUNE TISSUE PARTITION
+  I<-colnames(BIOGPS.df)[grep(colnames(BIOGPS.df),pattern = "T-cells|thymocyte|Tcell|thymus|B-cells|NK_cells|dendritic|granulo|macrophage|mast|erythrocyte|microglia|stem_cells|bcell|bone_marrow")]
+  I.df<-BIOGPS.df[,colnames(BIOGPS.df) %in% I]
+  I.means<-rowMeans(I.df,na.rm = TRUE)
+
+#NON-T-IMMUNE TISSUE PARTITION
+  NT<-colnames(BIOGPS.df)[grep(colnames(BIOGPS.df),pattern = "B-cells|NK_cells|dendritic|granulo|macrophage|mast|erythrocyte|microglia|stem_cells|bcell|bone_marrow")]
+  NT.df<-BIOGPS.df[,colnames(BIOGPS.df) %in% NT]
+  NT.means<-rowMeans(NT.df,na.rm = TRUE)
+
+#T CELL TISSUE PARTITION
+  TCELL<-colnames(BIOGPS.df)[grep(colnames(BIOGPS.df),pattern = "T-cells|thymocyte|Tcell|thymus")]
+  T.df<-BIOGPS.df[,colnames(BIOGPS.df) %in% TCELL]
+  T.means<-rowMeans(T.df,na.rm = TRUE)
+
+#RELATIVE EXPRESSION BETWEEN TISSUE PARTITIONS
+  I.v.NI<-log2(I.means)-log2(NI.means)
+  T.v.NT<-log2(T.means)-log2(NT.means)
+
+  tissue.expression<-data.frame(GENE=BIOGPS.df$GENE,IMMUNE_V_NON_IMMUNE=I.v.NI,T_CELL_V_NON_T_CELL=T.v.NT)
+```
+
+###############################################################################################
+# EXPRESSION OF ENU GENE COMPARED TO KNOW T CELL GENES (T CELL RECEPTOR SIGNALLING) 
+###############################################################################################
+
+### 1. FROM log2 fold change for each gene between tissue partitions,
+### 2. USE getKEGG to extract genes from selected biological pathways, to
+### 3. GET the tissue expression pattern for the selected biological pathway.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#PREPROCESS MOUSE AND ZF IDS
+  mouse_ID <- mouse_zf_ID[,1:2]
+  colnames(mouse_ID)<-c("ID","GENE")
+
+#ANNOTATE ENU WITH MOUSE ORTHOLOGS
+  cand$COLOUR<-c("ENU")
+  cand<-as.data.frame(unique(right_join(mouse_ID,cand, by="GENE")))
+  cand$ID[grepl(cand$GENE,pattern = "Fli")]<-"ENSMUSG00000016087"
+
+#EXTRACT GENES FROM KEGG PATHWAYS
+#T CELL RECEPTOR SIGNALLING
+  n<- "mmu04520"
+#IMMUNDEFICIENCY
+  o<- "mmu05340"
+  T.cell<-keggGet(c(n,o))
+#EXTRACT IDS FROM PATHWAY
+  T.cell<-as.data.frame(unlist(lapply(T.cell, '[[', "GENE")))
+  colnames(T.cell)<-"M_ID"
+  T.cell <- as.data.frame(T.cell[grep(";", T.cell$M_ID), ])
+  colnames(T.cell)<-"GENE"
+  T.cell<-as.data.frame(unlist(strsplit(as.character(T.cell$GENE),';')), ncol=1, byrow=TRUE)
+  colnames(T.cell)<-"GENE"
+  T.cell<- as.data.frame(T.cell[-grep(":", T.cell$GENE),])
+  colnames(T.cell)<-"GENE"
+  T.cell$COLOUR<-"T cell"
+  T.cell<-unique(T.cell)
+  T.cell<-as.data.frame(unique(right_join(mouse_ID,T.cell, by="GENE")))
+  T.cell$ID[grepl(T.cell$GENE,pattern = "Cd3d")]<-"ENSMUSG00000032094"
+  T.cell$ID[grepl(T.cell$GENE,pattern = "Cd3e")]<-"ENSMUSG00000032093"
+  T.cell$ID[grepl(T.cell$GENE,pattern = "Cd4")]<-"ENSMUSG00000023274"
+  T.cell$ID[grepl(T.cell$GENE,pattern = "Cd8a")]<-"ENSMUSG00000053977"
+  T.cell$ID[grepl(T.cell$GENE,pattern = "Cd8b1")]<-"ENSMUSG00000053044"
+  T.cell$ID[grepl(T.cell$GENE,pattern = "Cd40lg")]<-"ENSMUSG00000031132"
+  T.cell$ID[grepl(T.cell$GENE,pattern = "Icos")]<-"ENSMUSG00000026009"
+
+#P53 SIGNALLING
+  a<- "mmu04210"
+#EXTRACT IDS FROM PATHWAY
+  P53<-keggGet(a)
+  P53<-as.data.frame(unlist(lapply(P53, '[[', "GENE")))
+  colnames(P53)<-"M_ID"
+  P53 <- as.data.frame(P53[grep(";", P53$M_ID), ])
+  colnames(P53)<-"GENE"
+  P53<-as.data.frame(unlist(strsplit(as.character(P53$GENE),';')), ncol=1, byrow=TRUE)
+  colnames(P53)<-"GENE"
+  P53 <- as.data.frame(P53[-grep(":", P53$GENE),])
+  colnames(P53)<-"GENE"
+  P53$COLOUR<-c("p53")
+  P53<-as.data.frame(unique(right_join(mouse_ID,P53, by="GENE")))
+
+#RANDOM SELECTION OF GENES FROM GENOME
+  set.seed(1)
+  Random<-mouse_ID[sample(1:nrow(mouse_ID),nrow(cand),replace = FALSE),]
+  Random$COLOUR<-c("Random")
+
+#COMBINE IDS
+  IDs<-rbind.data.frame(cand,T.cell,P53, Random)
+  IDs<-IDs[complete.cases(IDs),]
+
+#EXTRACT PATHWAY GENES FROM BIOGPS DATA
+  res.tissue.expression<-tissue.expression[tissue.expression$GENE %in% IDs$GENE,]
+  res.tissue.expression$COLOUR<-IDs$COLOUR[match(res.tissue.expression$GENE, IDs$GENE)]
+```
+
+###############################################################################################
+# PLOT EXPRESSION OF GENE COMPARED TO KNOWN T CELL GENES
+###############################################################################################
+
+### 1. FROM expression pattern for the selected biological pathway,
+### 2. USE ggplot, to
+### 3. GET plots of expression in different tissue partitions.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#Scatterplot
+res.tissue.expression %>%
+    subset(COLOUR=="ENU" | COLOUR=="T cell") %>%
+    ggplot(aes(x=IMMUNE_V_NON_IMMUNE, y=T_CELL_V_NON_T_CELL, fill=as.factor(COLOUR))) +
+  geom_vline(xintercept = 0, color="grey") +
+  geom_hline(yintercept = 0, color="grey") +
+  geom_text_repel(aes(label = GENE,colour = factor(COLOUR)),  size=2,show.legend = FALSE) +
+  geom_point(size=2, shape=16, aes(colour = factor(COLOUR)),show.legend = FALSE) +
+  xlim(-2,8) +
+  ylim(-2,8) +
+  theme_bw() +
+    xlab("IMMUNE / NON_IMMUNE")+
+    ylab("T CELL / NON_T_IMMUNE")+
+scale_color_manual(values=c("#DD33FF", "black")) 
+```
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#PCA
+PCA.df<-as.data.frame(list(res.tissue.expression$COLOUR, res.tissue.expression[,2:3]))
+set.seed(1)
+PCA.tissue<-PCA(PCA.df, quali.sup = 1, graph = FALSE, ncp = 6) 
+p<-fviz_pca_biplot(PCA.tissue, 
+                   geom.ind = "point",
+                   pointshape = 20,
+                   alpha.ind = 0.1,
+                   pointsize = 2.5,
+                   habillage = as.factor(res.tissue.expression$COLOUR),
+                   palette = c("#DD33FF", "#FFC133","#33D1FF",  "black"),
+                   invisible = "var",
+                   xlim=c(-.5,.5),
+                   ylim=c(-.5,.5)
+)
+p <- fviz_add(p, PCA.tissue$quali.sup$coord, color = "black", geom = c("arrow", "text"), repel = TRUE, linetype = "solid")
+p
+```
+
+
+###################################################################################################
+# TISSUE EXPRESSION BY GENE
+###################################################################################################
+
+### 1. FROM bioGPS data,
+### 2. USE Z scores calculated for each gene by tissue, to
+### 3. GET a list of genes expressed by each tissue.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#LOG TRANSFORM PROBE INTENSITIES VALUES
+  df<-log(MOE430.raw[,4:ncol(MOE430.raw)])
+
+#CALCULATE MEAN EXPRESSION FOR EACH GENE ACROSS TISSUE TYPES
+  df.mean<-rowMeans(df)
+#CALCULATE SD EXPRESSION FOR EACH GENE ACROSS TISSUE TYPES
+  df.sd<-apply(df,1,sd)
+#CALCULATE Z SCORE FOR EACH GENE ACROSS TISSUE TYPES
+  df<-apply(df[,4:ncol(df)],2,function(X)(X-df.mean)/df.sd)
+  df<-as.data.frame(df)
+  t.df<-cbind.data.frame(MOE430.raw[,1:3], df)
+
+#LOG TRANSFORM PROBE INTENSITIES VALUES
+  df.2<-log(GNF1M.raw[,3:ncol(GNF1M.raw)])
+#CALCULATE MEAN EXPRESSION FOR EACH GENE ACROSS TISSUE TYPES
+  df.mean.2<-rowMeans(df.2)
+#CALCULATE SD EXPRESSION FOR EACH GENE ACROSS TISSUE TYPES
+  df.sd.2<-apply(df.2,1,sd)
+#CALCULATE Z SCORE FOR EACH GENE ACROSS TISSUE TYPES
+  df.2<-apply(df.2[,2:ncol(df.2)],2,function(X)(X-df.mean.2)/df.sd.2)
+  df.2<-as.data.frame(df.2)
+  t.df.2<-cbind.data.frame(GNF1M.raw[,1:2], df.2)
+  t.df.2<-t.df.2[, -which(colnames(t.df.2) %in% colnames(t.df[,4:ncol(t.df)]))]
+
+#JOIN BOTH MICROARRAY DATASETS
+  t.df<-inner_join(t.df[,-3], t.df.2[,-1], by="GENE")
+
+#MEAN AGGREGATE Z SCORES BY GENE
+  z.BIOGPS.df<-aggregate(t.df[,-2], by=list(t.df$ID), FUN=mean, drop = FALSE)
+  z.BIOGPS.df<-z.BIOGPS.df[,-2]
+  colnames(z.BIOGPS.df)[1]<-"ID"
+
+#ASSIGN GENES TO TISSUE IF Z SCORE >= 1.96 (95% CI)
+  cell.type.by.genes<-sapply(1:nrow(z.BIOGPS.df),function(X)colnames(z.BIOGPS.df[2:ncol(z.BIOGPS.df)])[z.BIOGPS.df[X,2:ncol(z.BIOGPS.df)]>=1.96])
+  names(cell.type.by.genes)<-z.BIOGPS.df$ID
+
+#STANDARD TISSUE NAMES
+  cell.type.by.genes<-lapply(cell.type.by.genes,function(X)toupper(X))
+  cell.type.by.genes<-lapply(cell.type.by.genes,function(X)gsub(X,pattern = "\\s+", replacement = "_"))
+  cell.type.by.genes<-lapply(cell.type.by.genes,function(X)gsub(X,pattern = "-", replacement = "_"))
+  cell.type.by.genes<-lapply(cell.type.by.genes,function(X)gsub(X,pattern = "\\.", replacement = "_"))
+  cell.type.by.genes<-lapply(cell.type.by.genes,function(X)gsub(X,pattern = "THYMOCYTE.*|T_CELL.*|.*TCELL", replacement = "T_CELL"))
+  cell.type.by.genes<-lapply(cell.type.by.genes,function(X)gsub(X,pattern = "ADRENALGLAND", replacement = "ADRENAL_GLAND"))
+  cell.type.by.genes<-lapply(cell.type.by.genes,function(X)gsub(X,pattern = "SKELETALMUSCLE", replacement = "ADRENAL_GLAND"))
+  cell.type.by.genes<-lapply(cell.type.by.genes,function(X)gsub(X,pattern = "SMALLINTESTINE", replacement = "SMALL_INTESTINE"))
+
+#PLOT TISSUES ENRICHED FOR ENU SCREEN GENES
+  enu.gene.cell.types<-cell.type.by.genes[names(cell.type.by.genes) %in% IDs$ID[IDs$COLOUR=="ENU"]]
+  par(mar=c(20,5,1,5))
+  enu.tissue.expression<-data.frame(sort(table(unlist(enu.gene.cell.types))/length(enu.gene.cell.types),decreasing = TRUE))
+  colnames(enu.tissue.expression)<-c("TISSUE", "PROPORTION")
+  enu.tissue.expression$SOURCE<-"ENU"
+
+#PLOT TISSUES ENRICHED FOR T CELL SIGNALLING GENES
+  T.cell.gene.cell.types<-cell.type.by.genes[names(cell.type.by.genes) %in% IDs$ID[IDs$COLOUR=="T cell"]]
+  par(mar=c(20,5,1,5))
+  T.cell.tissue.expression<-data.frame(sort(table(unlist(T.cell.gene.cell.types))/length(IDs$ID[IDs$COLOUR=="T cell"]),decreasing = TRUE))
+  colnames(T.cell.tissue.expression)<-c("TISSUE", "PROPORTION")
+  T.cell.tissue.expression$SOURCE<-"T cell"
+
+#PLOT TISSUES ENRICHED FOR P53 SIGNALLING GENES
+  p53.gene.cell.types<-cell.type.by.genes[names(cell.type.by.genes) %in% IDs$ID[IDs$COLOUR=="p53"]]
+  par(mar=c(20,5,1,5))
+  p53.tissue.expression<-data.frame(sort(table(unlist(p53.gene.cell.types))/length(p53.gene.cell.types),decreasing = TRUE))
+  colnames(p53.tissue.expression)<-c("TISSUE", "PROPORTION")
+  p53.tissue.expression$SOURCE<-"p53"
+
+#PLOT TISSUES ENRICHED FOR RANDOM GENES
+#REPEATEDLY SAMPLE GENES RANDOM
+  random.list<-replicate(n=1000,{
+  ind<-sample(1:length(cell.type.by.genes),size = length(IDs$ID[IDs$COLOUR=="ENU"]))
+  random.gene.cell.types<-cell.type.by.genes[ind]
+  table(unlist(random.gene.cell.types))/length(random.gene.cell.types)
+  })
+#Row bind list matching names
+  l <- do.call(rbind, lapply(lapply(random.list, unlist), "[",
+                        unique(unlist(c(sapply(random.list,names))))))
+  l<-l[,!is.na(colnames(l))]
+  random.tissue.expression<-data.frame(colMeans(l,na.rm = TRUE))
+  random.tissue.expression$TISSUE<-rownames(random.tissue.expression)
+  rownames(random.tissue.expression)<-NULL
+  random.tissue.expression$SOURCE<-"Random"
+  colnames(random.tissue.expression)[1]<-"PROPORTION"
+
+#PLOT PROPORTION OF EACH GENE LIST IS SIGNIFICANTLY EXPRESSED BY TISSUE TYPE
+  df<-rbind.data.frame(enu.tissue.expression,p53.tissue.expression,T.cell.tissue.expression, random.tissue.expression)
+  df<-df[df$TISSUE %in% enu.tissue.expression$TISSUE,]
+  df$SOURCE<-factor(df$SOURCE, levels=c("T cell", "ENU", "p53", "Random"))
+  df %>%
+      group_by(SOURCE) %>%
+      ggplot(aes(x=reorder(TISSUE,-PROPORTION),y=PROPORTION, fill=SOURCE)) +
+      geom_bar(stat = "identity", col="black") +
+      theme_bw() +
+      xlab(NULL) +
+      scale_fill_manual(values=c("black","deeppink", "gold", "deepskyblue")) +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+      facet_grid(rows = vars(SOURCE)) +
+      ylim(0,1)
+```
