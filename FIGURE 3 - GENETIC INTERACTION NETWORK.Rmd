@@ -1,0 +1,630 @@
+---
+title: "GENETIC.INTERACTION.NETWORK"
+author: "Connor O'Meara"
+date: "1/24/2020"
+output: html_document
+---
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#Load packages into library
+library(readxl)
+library(matrixStats)
+library(stringr)
+library(dplyr)
+library(lattice)
+library(gplots)
+library(ggplot2)
+library(ggrepel)
+library(plyr)
+library(tidyverse)
+library(gridExtra)
+library(pwr)
+library(igraph)
+library(reshape)
+library(pvclust)
+library(caret)
+library(dslabs)
+library(parallel)
+library(stabs)
+library(splines)
+library(foreach)
+library(kohonen)
+library(MASS)
+library(gam)
+library(gridExtra)
+library(ggfortify)
+library(corrplot)
+#IMPORT PATHWAY ANNOTATION FILE
+NODE_PATHWAY_ANNO <- read.delim("NODE_PATHWAY_ANNO", stringsAsFactors = FALSE)
+```
+
+###################################################################################################
+# IMPORT RAW DATA AND DATA PREPROCESSING
+###################################################################################################
+
+### 1. FROM rag/ghrh values for WT, MUT1, MUT2 and double mutant (DB.MUT) for each pairwise gene interaction experiment,
+### 2. USE the Product/Multiplicative method to predict the expected DB.MUT rag/ghrh value for each experiment and compare to observed DB.MUT rag/ghrh value, to
+### 3. GET effect size of geneteic interaction (log2 fold-change), genetic interaction type (positive, negative and non-interactive) and significance of interaction.
+
+```{r echo=TRUE, fig.align='center', fig.height=6, fig.keep='all', fig.width=10, message=FALSE, warning=FALSE, results='hide'}
+#CREATE LIST OF FILES WITHIN WORKING DIRECTORY, INCLUDING SUBFOLDERS
+  list.raw<- list.files(pattern=".xlsx", recursive = TRUE) 
+
+#READ DATA FROM EACH FILE USING LIST OF DATA FILES
+  data.raw<- as.vector(lapply(list.raw, read_excel, range="A1:D25", col_names=TRUE, col_types = c("numeric", "numeric", "numeric", "numeric"))) 
+
+#REMOVE "0" VALUE BY ADDING 0.00001 TO ALL VALUES
+    data.raw<-lapply(data.raw,function(X)X+0.00001)
+
+#RENAME COLUMN NAMES
+  col.names<-c("WT", "MUT1", "MUT2", "DB.MUT")
+  for (X in 1:length(data.raw))colnames(data.raw[[X]]) = col.names
+
+#CALCULATE FITNESS OF SINGLE MUTANTS AND DOUBLE MUTANTS RELATIVE TO WT
+  GI.list<-lapply(data.raw, function(X)cbind(X, means=t(apply(X, 1, function(Y)Y/colMeans(X[,1, drop=FALSE],na.rm = TRUE)))))
+
+#RENAME LISTS WITH FILE NAMES
+  names(GI.list)<-list.raw
+
+#CALCULATE NUMBER OF NA'S FOR EACH LIST
+  subset.GI.list<-lapply(1:length(GI.list), function(X)apply(GI.list[[X]][4],2,function(Y)sum(is.na(Y))))
+
+#RETAIN LISTS WITH AT LEAST 3 DATA POINTS 
+  GI.list<-GI.list[as.vector(do.call(rbind,lapply(subset.GI.list, function(X)X<23)))] 
+
+#COUNT THE NUMBER OF FISH USED IN EACH EXPERIMENT
+  GI.list<-lapply(GI.list, function(X)cbind(X, n.WT=colSums(!is.na(X))[1], row.names = NULL))
+  GI.list<-lapply(GI.list, function(X)cbind(X, n.MUT1=colSums(!is.na(X))[2], row.names = NULL))
+  GI.list<-lapply(GI.list, function(X)cbind(X, n.MUT2=colSums(!is.na(X))[3], row.names = NULL))
+  GI.list<-lapply(GI.list, function(X)cbind(X, n.DB.MUT=colSums(!is.na(X))[4], row.names = NULL))
+
+#PERFORM T.TEST ON SINGLE MUTANTS AND DOUBLE MUTANTS RELATIVE TO WT, AND DOUBLE MUTANT RELATIVE TO LEAST 
+  list.names<-names(GI.list)
+
+#CALCULATE SD FOR EACH GROUP
+  GI.list<-lapply(GI.list, function(X)cbind(X, SD.WT=sd(X$means.WT, na.rm = TRUE)))
+  GI.list<-lapply(GI.list, function(X)cbind(X, SD.MUT1=sd(X$means.MUT1, na.rm = TRUE)))
+  GI.list<-lapply(GI.list, function(X)cbind(X, SD.MUT2=sd(X$means.MUT2, na.rm = TRUE)))
+  GI.list<-lapply(GI.list, function(X)cbind(X, SD.DB.MUT=sd(X$means.DB.MUT, na.rm = TRUE)))
+
+#CALCULATE MEANS FOR EACH GROUP
+  GI.list.means<-lapply(GI.list,function(X)colMeans(X, na.rm = TRUE))
+
+#BIND ALL EXPERIMENTS TOGETHER
+  GI.df<-as.data.frame(do.call(rbind, GI.list.means))
+
+#REMOVE EXPERIMENTS IN WHICH MUTANT ARE NO LESS THAN WT
+  GI.df<-GI.df[GI.df$means.MUT1<1 & GI.df$means.MUT2<1,]
+
+#ADD FILE NAME TO EACH ROW IT REPRESENTS
+  GI.df<-data.frame(FILE=rownames(GI.df), GI.df)
+
+#ASSIGNMENT EXPERIMENT TYPE BY EXTRACTING FOLDER NAME
+  for(i in 1:nrow(GI.df)){
+  GI.df$EXP.type[i]<-str_split_fixed(GI.df$FILE[i],"[/.]",2)[,1]
+  }   
+
+#SORT NODE NAMES ALPHABETICALLY
+  GI.df<-cbind.data.frame(NODE1.2=gsub(".*GI\\s*|.xlsx.*", "", rownames(GI.df)),GI.df)
+  node.names<-data.frame(NODE1=str_split_fixed(GI.df$NODE1.2, "\\+", 2)[,1], NODE2=str_split_fixed(GI.df$NODE1.2, "\\+", 2)[,2],stringsAsFactors = F)
+  node.names<-data.frame(apply(node.names,2,function(X)gsub(X,pattern = " ", replacement = "")),stringsAsFactors = F)
+  node.names<-do.call(rbind,apply(t(apply(node.names,1,sort)),1,function(X)data.frame(NODE1=X[1],NODE2=X[2])))
+  GI.df<-cbind.data.frame(FILE=GI.df[,2],node.names, EXP.type=GI.df$EXP.type, GI.df[,3:(ncol(GI.df)-1)])
+  
+#REMOVE SPACES FROM NODE NAMES (IF ANY)
+  GI.df$NODE1<-toupper(gsub(" ", "", GI.df$NODE1))
+  GI.df$NODE2<-toupper(gsub(" ", "", GI.df$NODE2))
+
+#CONVERT NODE INFORMATION TO CHARACTERS
+  GI.df[,1:4]<-apply(GI.df[,1:4],2, as.character)
+
+#COMBINE REPEATED EXPERIMENTS
+  GI.df.mean<-aggregate(.~NODE1+NODE2+EXP.type, GI.df[,-1], mean,na.action=na.omit)
+  GI.df.sum<-aggregate(.~NODE1+NODE2+EXP.type, GI.df[,-1],sum,na.action=na.omit)
+  GI.df.mean[,colnames(GI.df.mean) %in% c("n.WT", "n.MUT1", "n.MUT2", "n.DB.MUT")]<-GI.df.sum[,colnames(GI.df.sum) %in% c("n.WT", "n.MUT1", "n.MUT2", "n.DB.MUT")]
+
+#CONCATENATE FILE NAMES FOR COMBINED DATASETS
+GI.df.lab<-aggregate(data=GI.df[,1:4],.~NODE1+NODE2+EXP.type,FUN=paste,collapse=" , ")
+
+#JOIN DATA
+  GI.df<-full_join(GI.df.lab,GI.df.mean,by=c("NODE1", "NODE2", "EXP.type"))
+  GI.df<-GI.df[complete.cases(GI.df),]
+
+#CALCULATE THE EXPECTED FITNESS OF THE DOUBLE MUTANT (MULTIPLICATIVE METHOD)
+  GI.df$PRODUCT<-GI.df$means.MUT1*GI.df$means.MUT2
+
+#CALCULATE LOG2 FOLD-CHANGE BETWEEN OBSERVED (MEANS.DB.MUT) AND EXPECTED FITNESS (PRODUCT)
+  GI.df$PRODUCT.log2.FC<-log2(GI.df$means.DB.MUT)-log2(GI.df$PRODUCT)
+
+#CALCULATE ERROR FOR EXPECTED FITNESS BY PROPAGATING ERROR FROM WT AND SINGLE MUTANTS
+  GI.df$Prop.SD<-GI.df$PRODUCT * sqrt((GI.df$SD.MUT1/GI.df$means.MUT1)^2 + 
+                                            (GI.df$SD.MUT2/GI.df$means.MUT2)^2)
+#CALCULATE T STATISTIC BETWEEN EXPECTED AND OBSERVED DB.MUT USING MEAN, SD, N
+ t.test2 <- function(m1,m2,s1,s2,n1,n2,m0=0,equal.variance=FALSE)
+{
+    if( equal.variance==FALSE ) 
+    {
+        se <- sqrt( (s1^2/n1) + (s2^2/n2) )
+        # welch-satterthwaite df
+        df <- ( (s1^2/n1 + s2^2/n2)^2 )/( (s1^2/n1)^2/(n1-1) + (s2^2/n2)^2/(n2-1) )
+    } else
+    {
+        # pooled standard deviation, scaled by the sample sizes
+        se <- sqrt( (1/n1 + 1/n2) * ((n1-1)*s1^2 + (n2-1)*s2^2)/(n1+n2-2) ) 
+        df <- n1+n2-2
+    }      
+    t <- (m1-m2-m0)/se 
+    dat <- c(m1-m2, se, t, 2*pt(-abs(t),df))    
+    names(dat) <- c("Difference of means", "Std Error", "t", "p-value")
+    return(dat) 
+ } 
+
+#CALCULATE SIGNIFICANCE BETWEEN OBSERVED AND EXPECTED DB.MUT RAG1/GHRH VALUES
+ ttest<-list()
+for(i in 1:nrow(GI.df)){
+  ttest[[i]]<-t.test2(m1 = GI.df$means.DB.MUT[i],
+          m2 = GI.df$PRODUCT[i], 
+          s1 = GI.df$SD.DB.MUT[i],
+          s2 = GI.df$Prop.SD[i],
+          n1 = GI.df$n.DB.MUT[i],
+          n2 = sum(GI.df$n.MUT1[i],GI.df$n.MUT2[i]),
+          equal.variance=FALSE)
+}
+  GI.df<-cbind.data.frame(GI.df, do.call(rbind,ttest)[,3:4])
+
+#DEFINE GENETIC INTERACTION TYPE
+  GI.df$GI.type<-NA
+
+#INTERACTION TYPE (MULTIPLICATIVE MODEL)
+    for (X in 1:nrow(GI.df))GI.df$GI.type[X] = if(GI.df$PRODUCT.log2.FC[X]>0 & #positive
+             GI.df$`p-value`[X]<=0.1 & # significant
+             GI.df$means.DB.MUT[X]>(GI.df$PRODUCT[X])+(GI.df$Prop.SD[X]) & #outside error of expected fitness
+             GI.df$means.DB.MUT[X]>((min(GI.df$means.MUT1[X],GI.df$means.MUT2[X])+(c(GI.df$SD.MUT1[X],GI.df$SD.MUT2[X])[which.min(c(GI.df$means.MUT1[X],GI.df$means.MUT2[X]))])))) {# greater than least fit mutant
+    print("POSITIVE - SUPPRESSIVE")
+    } else if (GI.df$PRODUCT.log2.FC[X]>0 &
+              GI.df$`p-value`[X]<=0.1 &
+              GI.df$means.DB.MUT[X]>(GI.df$PRODUCT[X])+(GI.df$Prop.SD[X]) & #outside error of expected fitness
+             GI.df$means.DB.MUT[X]<((min(GI.df$means.MUT1[X],GI.df$means.MUT2[X])+(c(GI.df$SD.MUT1[X],GI.df$SD.MUT2[X])[which.min(c(GI.df$means.MUT1[X],GI.df$means.MUT2[X]))]))))  {
+      print("POSITIVE - COEQUAL")
+  } else if (GI.df$PRODUCT.log2.FC[X]<0 & 
+             GI.df$`p-value`[X]<=0.1 &
+             GI.df$means.DB.MUT[X]<(GI.df$PRODUCT[X])-(GI.df$Prop.SD[X])) {
+      print("NEGATIVE")
+    } else print("NON-INTERACTIVE")
+  
+  GI.df$NODE1<-gsub(x = GI.df$NODE1, pattern = ".*5FL.*|.*5-FL.*",replacement = "5FU")
+  GI.df$NODE2<-gsub(x = GI.df$NODE2, pattern = ".*5FL.*|.*5-FL.*",replacement = "5FU")
+
+#APPEND PATHWAY INFORMATION TO EACH NODE
+  matched.df<-data.frame(FILE=GI.df$FILE, NODE1=GI.df$NODE1, PATHWAY1=NODE_PATHWAY_ANNO$PATHWAY[match(GI.df$NODE1, NODE_PATHWAY_ANNO$NODE1)], NODE2=GI.df$NODE2, PATHWAY2=NODE_PATHWAY_ANNO$PATHWAY[match(GI.df$NODE2, NODE_PATHWAY_ANNO$NODE1)],stringsAsFactors = F)
+
+#COLUMN FOR CONCATENATED NODES AND PATHWAYS
+  matched.df$NODES<-apply(t(apply(matched.df[,colnames(matched.df) %in% c("NODE1", "NODE2")],1,sort)),1,function(X)paste(X[1],X[2],sep = "_"))
+ matched.df$PATHWAYS<- apply(t(apply(matched.df[,colnames(matched.df) %in% c("PATHWAY1", "PATHWAY2")],1,sort)),1,function(X)paste(X[1],X[2],sep = "_"))
+  matched.df<-as.data.frame(apply(matched.df,2, as.character))
+
+#CONVERT NODE AND PATHWAY INFORMATION TO CHARACTERS
+  GI.df<-left_join(matched.df,GI.df,by=c("FILE", "NODE1", "NODE2"))
+  GI.df[,1:8]<-as.data.frame(apply(GI.df[,1:8],2,as.character),stringsAsFactors = FALSE)
+```
+
+###################################################################################################
+# PLOT GENETIC INTERACTION PROPORTION AND FREQUENCY BY NODES AND PATHWAYS
+###################################################################################################
+
+### 1. FROM genetic.interaction.data in the Annotation_files folder generated above,
+### 2. USE base R and fisher's exact test, to
+### 3. GET proportion and frequency of genetic interaction for individual nodes, pathways and between pathways and determine which are signficant.
+
+```{r echo=TRUE, fig.align='center', fig.height=6, fig.keep='all', fig.width=10, message=FALSE, warning=FALSE, results='hide'}
+
+#IMPORT GENETIC INTERACTION DATA.FRAME 
+  GI.df <- read.delim("Genetic.interaction.data", stringsAsFactors = FALSE)
+
+#REMOVE MICELLANEOUS PATHWAYS AND AMBIGOUS INHIBITORS
+  GI.df<-GI.df %>%
+    filter(PATHWAY1!="MISCELLANEOUS", PATHWAY2!="MISCELLANEOUS", NODE1!="SAHA", NODE2!="SAHA")
+
+#ENSURE DATA IS REPRESENTED FOR EACH NODE
+  GI.df.2<-GI.df %>%
+    dplyr::select(NODE1, NODE2, PATHWAYS, GI.type)
+  GI.df.2<-rbind(GI.df.2,data.frame(NODE1=GI.df.2$NODE2, NODE2=GI.df.2$NODE1, PATHWAYS=GI.df.2$PATHWAYS, GI.type=GI.df.2$GI.type))
+
+#INDIVIDUAL NODES
+    #PLOT PROPORTIONS
+    plot.order<-unique(NODE_PATHWAY_ANNO$NODE1[order(NODE_PATHWAY_ANNO$PATHWAY, decreasing = F)])
+    plot.order<-plot.order[plot.order %in% GI.df.2$NODE1]
+    INT.p<-prop.table(table(GI.df.2$NODE1,GI.df.2$GI.type),1)
+    barplot(as.matrix(t(INT.p[match(plot.order,(rownames(INT.p))),])), 
+            las=2, 
+            cex.names = 0.6, 
+            col = c("deeppink", "black", "darkslategray1", "deepskyblue"),
+            main = "Interaction - Proportion") 
+    legend("left", 
+           legend = c("POSITIVE - SUPPRESSIVE", "POSITIVE - COEQUAL", "NON-INTERACTIVE", "NEGATIVE"), 
+           fill = c("deepskyblue", "lightcyan", "black", "deeppink"),
+           horiz = F, inset = c(1,0), xpd = TRUE)
+
+  #PLOT FREQUENCY
+    INT.f<-table(GI.df.2$NODE1,GI.df.2$GI.type)
+    barplot(as.matrix(t(INT.f[match(plot.order,(rownames(INT.f))),])), 
+            las=2, 
+            ylim = c(0,35),
+            cex.names = 0.6, 
+            col = c("deeppink", "black", "lightcyan", "deepskyblue"),
+            main = "Interaction - Frequency"
+    ) 
+    nodes<-unique(c(GI.df$NODE1, GI.df$NODE2))
+  
+  #NON-PARAMETRIC TEST FOR SIGNFICANCE
+    fishers.df<-matrix(ncol = 4,data = t(INT.f), byrow = T)
+    colnames(fishers.df)<-c("NEGATIVE", "NON-INTERACTIVE", "POSITIVE - COEQUAL", "POSITIVE - SUPPRESSIVE")
+    rownames(fishers.df)<-rownames(INT.f)
+    fishers.df<-as.data.frame(fishers.df)
+    fishers.df$POSITIVE<-rowSums(fishers.df[,3:4])
+    fishers.df<-fishers.df[,-c(3:4)]
+    fishers.df$Fishers.t.test<-sapply(1:nrow(fishers.df),function(X) fisher.test(rbind(fishers.df[X,], colSums(fishers.df)))$p.value)
+        fishers.df<-fishers.df[order(fishers.df$Fishers.t.test,decreasing = F),]
+    fishers.df<-rbind(fishers.df,colSums(fishers.df))
+    rownames(fishers.df)[nrow(fishers.df)]<-"Total"
+    fishers.df[nrow(fishers.df), ncol(fishers.df)]<-1
+    fishers.df$BH.corrected<-p.adjust(fishers.df$Fishers.t.test, method = "BH")
+    tab1<-fishers.df
+
+#INDIVIDUAL PATHWAYS
+    #PLOT FREQUENCY
+    pathwys<-unique(c(GI.df$PATHWAY1, GI.df$PATHWAY2))
+     mt.by.pathway<-list()
+    for(i in 1:length(pathwys)){
+      mt.by.pathway[[i]]<-table(GI.df$GI.type[which(grepl(x = GI.df$PATHWAYS, pattern = pathwys[i])==TRUE)])
+    }
+    mt.by.pathway<-do.call(bind_rows,mt.by.pathway)
+    mt.by.pathway[is.na(mt.by.pathway)]<-0
+    rownames(mt.by.pathway)<-pathwys
+    par(mar=c(8,5,5,0))
+    barplot(t(mt.by.pathway), 
+            las=2, 
+            ylim = c(0,150),
+            cex.names = 0.6, 
+            col = c("deeppink", "black", "lightcyan", "deepskyblue"),
+            main = "Interaction - Frequency"
+    ) 
+    mt.by.pathway<-as.data.frame(mt.by.pathway)
+    mt.by.pathway$POSITIVE<-rowSums(mt.by.pathway[,3:4])
+    mt.by.pathway<-mt.by.pathway[,-c(3:4)]
+  
+  #NON-PARAMETRIC TEST FOR SIGNFICANCE
+    mt.by.pathway$Fishers.t.test<-sapply(1:nrow(mt.by.pathway),function(X) X = fisher.test(rbind(mt.by.pathway[X,], colSums(mt.by.pathway)))$p.value)
+    mt.by.pathway<-mt.by.pathway[order(mt.by.pathway$Fishers.t.test,decreasing = F),]
+    mt.by.pathway$BH.corrected<-p.adjust(mt.by.pathway$Fishers.t.test, method = "BH")
+    tab2<-mt.by.pathway
+    mt.by.pathway<-list()
+  
+  #PLOT PROPORTIONS
+    for(i in 1:length(pathwys)){
+      mt.by.pathway[[i]]<-prop.table(table(GI.df$GI.type[which(grepl(x = GI.df$PATHWAYS, pattern = pathwys[i])==TRUE)]))
+    }
+    mt.by.pathway<-do.call(bind_rows,mt.by.pathway)
+    mt.by.pathway[is.na(mt.by.pathway)]<-0
+    rownames(mt.by.pathway)<-pathwys
+    par(mar=c(8,5,5,0))
+    barplot(t(mt.by.pathway), 
+            las=2, 
+            ylim = c(0,1),
+            cex.names = 0.6, 
+            col = c("deeppink", "black", "lightcyan", "deepskyblue"),
+            main = "Interaction - Proportion"
+    ) 
+#COMBINED PATHWAY    
+  #PLOT FREQUENCY   
+    INT.f<-table(GI.df$PATHWAYS,GI.df$GI.type)
+    par(mar=c(8,5,5,0))
+    barplot(as.matrix(t(INT.f[order(rowSums(INT.f), decreasing = T),])), 
+          las=2, 
+         ylim = c(0,40),
+          cex.names = 0.6, 
+          col = c("deeppink", "black", "lightcyan", "deepskyblue"),
+          main = "Interaction - Proportion") 
+  
+  #PLOT PROPORTIONS   
+    INT.p<-prop.table(table(GI.df$PATHWAYS,GI.df$GI.type),1)
+    par(mar=c(8,5,5,0))
+    barplot(as.matrix(t(INT.p[order(rowSums(INT.f), decreasing = T),])), 
+          las=2, 
+          cex.names = 0.6, 
+          col = c("deeppink", "black", "lightcyan", "deepskyblue"),
+          main = "Interaction - Proportion") 
+  
+  #NON-PARAMETRIC TEST FOR SIGNFICANCE
+    fishers.df<-matrix(ncol = 4,data = t(INT.f), byrow = T)
+    colnames(fishers.df)<-c("NEGATIVE", "NON-INTERACTIVE", "POSITIVE - COEQUAL", "POSITIVE - SUPPRESSIVE")
+    rownames(fishers.df)<-rownames(INT.p)
+    fishers.df<-as.data.frame(fishers.df)
+    fishers.df$POSITIVE<-rowSums(fishers.df[,3:4])
+    fishers.df<-fishers.df[,-c(3:4)]
+    fishers.df$Fishers.t.test<-sapply(1:nrow(fishers.df),function(X) fisher.test(rbind(fishers.df[X,], colSums(fishers.df)))$p.value)
+    fishers.df<-fishers.df[order(fishers.df$Fishers.t.test,decreasing = F),]
+    fishers.df<-rbind(fishers.df,colSums(fishers.df))
+    rownames(fishers.df)[nrow(fishers.df)]<-"Total"
+    fishers.df[nrow(fishers.df), ncol(fishers.df)]<-1
+        fishers.df$BH.corrected<-p.adjust(fishers.df$Fishers.t.test, method = "BH")
+        tab3<-fishers.df
+```
+
+###################################################################################################
+#### PLOT GENETIC INTERACTION NETWORK (ALL INTERACTIONS)
+###################################################################################################
+
+### 1. FROM genetic.interaction.data in the Annotation_files folder generated above,
+### 2. USE igraphs, to
+### 3. GET plots of genetic interactions between nodes, grouping by biological pathway.
+
+```{r, message=FALSE, warning=FALSE, results='hide',fig.keep='all', echo=TRUE,fig.height = 12,fig.width = 12,fig.align='center'}
+
+#REMOVE MICELLANEOUS PATHWAYS AND AMBIGOUS INHIBITORS
+  NODE_PATHWAY_ANNO<-NODE_PATHWAY_ANNO[NODE_PATHWAY_ANNO$PATHWAY!="MISCELLANEOUS" & NODE_PATHWAY_ANNO$NODE1!="CCT5" & NODE_PATHWAY_ANNO$NODE1!="PNRC1" & NODE_PATHWAY_ANNO$NODE1!="AMX" & NODE_PATHWAY_ANNO$NODE1!="SAHA" & NODE_PATHWAY_ANNO$NODE1!="HOMO",]  
+  NODE_PATHWAY_ANNO<-NODE_PATHWAY_ANNO %>%
+    filter(!NODE1 %in% c("CCT5", "AMX", "SAHA", "HOMO"))
+
+#DEFINE EDGE AND NODE ATTRIBUTE
+  V<- NODE_PATHWAY_ANNO
+  E<- GI.df %>% dplyr::select(NODE1,NODE2,PATHWAY1, PATHWAY2, PRODUCT.log2.FC, GI.type, EXP.type) %>% filter(PRODUCT.log2.FC!="-Inf", NODE1!="CCT5", NODE1 %in% NODE_PATHWAY_ANNO$NODE1, NODE2 %in% NODE_PATHWAY_ANNO$NODE1 )
+    E$GI.type[grepl(E$GI.type,pattern = "POSITIVE.*")]<-"POSITIVE"
+
+#CREATE NETWORK
+    net<- graph.data.frame(d=E, vertices=V, directed=FALSE)
+
+#CREATE COLOUR VECTORS FOR EDGES AND NODES
+    edge.col<- c("deeppink","black","deepskyblue")
+    node.col<- c("deeppink3","firebrick1","darkorange","mediumseagreen", "cornflowerblue","slategray1","gold")
+     
+#GROUP NODES BY GO TERM
+  V(net)$Group1 = node.col[as.factor(NODE_PATHWAY_ANNO$PATHWAY)]
+
+#CREATE X Y COORDINATES FOR PREFERRED LAYOUT IN IGRAPH
+  ER<-NODE_PATHWAY_ANNO$NODE1[NODE_PATHWAY_ANNO$PATHWAY=="ER"]
+  DNA<-NODE_PATHWAY_ANNO$NODE1[NODE_PATHWAY_ANNO$PATHWAY=="DNA"]
+  SPLICE<-NODE_PATHWAY_ANNO$NODE1[NODE_PATHWAY_ANNO$PATHWAY=="MRNA PROCESSING"]
+  CELL<-NODE_PATHWAY_ANNO$NODE1[NODE_PATHWAY_ANNO$PATHWAY=="CHR.SEG"]
+  RIBO<-NODE_PATHWAY_ANNO$NODE1[NODE_PATHWAY_ANNO$PATHWAY=="RIBOSOME"]
+  IMMUNE<-NODE_PATHWAY_ANNO$NODE1[NODE_PATHWAY_ANNO$PATHWAY=="IMMUNE"]
+  PIP<-NODE_PATHWAY_ANNO$NODE1[NODE_PATHWAY_ANNO$PATHWAY=="PIP"]
+
+#CREATE A PREFERRED CIRCULAR LAYOUT FOR EACH PATHWAY GROUP, MULTIPLED BY SCALAR TO CHANGE DIAMETER OF PATHWAY NODE
+  lay.list=list(
+    ER.lay <- layout_in_circle(induced_subgraph(net, V(net)$name %in% ER))*3.3,
+    RIBO.lay <- layout_in_circle(induced_subgraph(net, V(net)$name %in% RIBO))*1.65,
+    SPLICE.lay <-layout_in_circle(induced_subgraph(net,V(net)$name %in% SPLICE))*4.3,
+    CELL.lay <- layout_in_circle(induced_subgraph(net, V(net)$name %in% CELL))*2, 
+    IMMUNE.lay <- layout_in_circle(induced_subgraph(net, V(net)$name %in% IMMUNE))*3.9,
+    PIP.lay <- layout_in_circle(induced_subgraph(net, V(net)$name %in% PIP))*1.5,  
+    DNA.lay <- layout_in_circle(induced_subgraph(net, V(net)$name %in% DNA))*4.8
+   )
+  l<-rbind(ER.lay,RIBO.lay,SPLICE.lay,CELL.lay,IMMUNE.lay,PIP.lay,DNA.lay)
+  l.names<-c(ER,RIBO ,SPLICE,CELL,IMMUNE,PIP,DNA)
+  l = do.call(rbind,lay.list)
+  l =do.call(rbind,lapply(1:7,function(i)cbind(lay.list[[i]][,1]+13*cos(((1:7)*2*pi/7))[[i]],lay.list[[i]][,2]+13*sin(((1:7)*2*pi/7))[[i]])))
+  l = l[order(match(l.names,V$NODE1)),]
+
+#PLOT NETWORKS PARTITIONED BY BY GENETIC INTERACTION TYPE
+  par(mar=c(1,1,1,1))
+#PLOT ALL GENETIC INTERACTIONS
+  plot(net,
+        vertex.shape="circle",
+        vertex.size=15,	
+      vertex.label.color= "black",
+        vertex.label.font	=2,
+       vertex.label.cex=0.6,
+       vertex.label.color="#000000",
+        edge.curved=0, 
+        vertex.frame.color="#000000", 
+        edge.color=edge.col[as.factor(E(net)$GI.type)], 
+        vertex.label.cex=.7, 
+        edge.width=abs(E(net)$PRODUCT.log2.FC),
+        vertex.color=V(net)$Group1, 
+        layout=l)
+
+#PLOT NEGATIVE INTERACTIONS
+  net.neg<-delete_edges(net, E(net)[E(net)$GI.type!="NEGATIVE"])
+  plot(net.neg,
+        vertex.shape="circle",
+        vertex.size=15,	
+      vertex.label.color= "black",
+        vertex.label.font	=2,
+       vertex.label.cex=0.6,
+        edge.curved=0, 
+        vertex.frame.color="#555555", 
+        edge.color=edge.col[-c(2,3,4)][as.factor(E(net.neg)$GI.type)], 
+        vertex.label.cex=.7, 
+        edge.width=abs(E(net.neg)$PRODUCT.log2.FC),
+        vertex.color=V(net.neg)$Group1, 
+        layout=l)
+#PLOT POSITIVE INTERACTION (SUPPRESSIVE AND COEQUAL)
+  net.pos<-delete_edges(net, E(net)[E(net)$GI.type=="NEGATIVE"])
+  net.pos<-delete_edges(net.pos, E(net.pos)[E(net.pos)$GI.type=="NON-INTERACTIVE"])
+  plot(net.pos,
+        vertex.shape="circle",
+        vertex.size=15,	
+       vertex.label.color= "black",
+        vertex.label.font	=2,
+       vertex.label.cex=0.6,
+        edge.curved=0, 
+        vertex.frame.color="#555555", 
+        edge.color=edge.col[-c(1,2)][as.factor(E(net.pos)$GI.type)], 
+        vertex.label.cex=.7, 
+        edge.width=abs(E(net.pos)$PRODUCT.log2.FC),
+        vertex.color=V(net.pos)$Group1, 
+        layout=l)
+#PLOT NON-INTERACTIVE
+  net.n.i<-delete_edges(net, E(net)[E(net)$GI.type=="NEGATIVE"])
+  net.n.i<-delete_edges(net.n.i, E(net.n.i)[E(net.n.i)$GI.type=="POSITIVE - SUPPRESSIVE"])
+  net.n.i<-delete_edges(net.n.i, E(net.n.i)[E(net.n.i)$GI.type=="POSITIVE - COEQUAL"])
+  plot(net.n.i,
+        vertex.shape="circle",
+        vertex.size=15,	
+        vertex.label.font	=2,
+      vertex.label.color= "black",
+       vertex.label.cex=0.6,
+        edge.curved=0, 
+        vertex.frame.color="#555555", 
+        edge.color=edge.col[-c(1,3,4)][as.factor(E(net.n.i)$GI.type)], 
+        vertex.label.cex=.7, 
+        edge.width=abs(E(net.n.i)$PRODUCT.log2.FC),
+        vertex.color=V(net.n.i)$Group1, 
+        layout=l)
+```
+
+###################################################################################################
+#### PLOT GENETIC INTERACTION NETWORK (PROPORTION BETWEEN PATHWAYS)
+###################################################################################################
+
+### 1. FROM genetic.interaction.data in the Annotation_files folder generated above,
+### 2. USE table and igraphs, to
+### 3. GET plots of genetic interactions proportions between nodes, grouping by biological pathway.
+
+```{r echo=TRUE, fig.align='center', fig.height=10, fig.keep='all', fig.width=10, message=FALSE, warning=FALSE, results='hide'}
+
+#GROUP COEQUAL AND SUPPRESSIVE INTERACTION INTO A SINGLE POSITIVE GROUP
+  GI.df.2<-GI.df %>% filter(PRODUCT.log2.FC!="-Inf", )
+  GI.df.2$GI.type<-gsub("POSITIVE - COEQUAL|POSITIVE - SUPPRESSIVE", "POSITIVE",x = GI.df.2$GI.type)
+
+#CREATE TABLE OF GENETIC INTERACTION TYPES PROPORTIONS BETWEEN PATHWAYS
+  INT.p<-prop.table(table(GI.df.2$PATHWAYS,GI.df.2$GI.type),1)
+  x<-as.data.frame(INT.p)
+  y<-cbind.data.frame(str_split(x$Var1, "_", simplify = T),x)
+  colnames(y)<-c("PATHWAY1", "PATHWAY2", "PATHWAYS", "GI.type", "PROP")
+
+#DEFINE EDGE AND NODE ATTRIBUTE
+  V<- unique(c(as.character(y$PATHWAY1), as.character(y$PATHWAY2)))      
+  E<- y 
+
+#CREATE NETWORK
+  net.path<- graph.data.frame(d=E, vertices=V, directed=FALSE)
+
+#CREATE A PREFERRED CIRCULAR LAYOUT FOR EACH PATHWAY GROUP, MULTIPLED BY SCALAR TO CHANGE DIAMETER OF PATHWAY NODE
+  lay.list=list(
+    ER.lay <- layout_in_circle(induced_subgraph(net.path, V(net.path)$name == "ER")),
+    RIBO.lay <- layout_in_circle(induced_subgraph(net.path, V(net.path)$name == "RIBOSOME")),
+    SPLICE.lay <-layout_in_circle(induced_subgraph(net.path,V(net.path)$name == "MRNA PROCESSING")),
+    CELL.lay <- layout_in_circle(induced_subgraph(net.path, V(net.path)$name == "CHR.SEG")),
+    PIP.lay <- layout_in_circle(induced_subgraph(net.path, V(net.path)$name == "PIP")),
+    IMMUNE.lay <- layout_in_circle(induced_subgraph(net.path, V(net.path)$name == "IMMUNE")),
+    DNA.lay <- layout_in_circle(induced_subgraph(net.path, V(net.path)$name == "DNA"))
+  )
+  l<-rbind(ER.lay,RIBO.lay,SPLICE.lay,CELL.lay,IMMUNE.lay,PIP.lay ,DNA.lay)
+  l.names<-c("ER","RIBOSOME" ,"MRNA PROCESSING","CHR.SEG", "IMMUNE","PIP","DNA")
+  l =do.call(rbind,lapply(1:7,function(i)cbind(lay.list[[i]][,1]+13*cos(((1:7)*2*pi/7))[[i]],lay.list[[i]][,2]+13*sin(((1:7)*2*pi/7))[[i]])))
+  l = l[order(match(l.names,E$PATHWAY1)),]
+
+#CREATE COLOUR VECTORS FOR EDGES AND LINE CURVITURE VECTORS
+  edge.col.cor<- c("deeppink", "black", "deepskyblue")
+  curve.vec<-c(-0.1,0,0.1)
+
+#LABEL EDGE IT PROPORTION IS 40% OR GREATER
+  x<-round(E(net.path)$PROP,1)
+  x[x<0.4]<-NA
+#PLOT ALL GENETIC INTERACTIONS BY PROPORTIONS
+  plot(net.path,
+       vertex.shape="circle",
+       vertex.size=c(5,10.1,7,5,7,4.5,4.5)*9.5,	
+       vertex.label.font	=2,
+       vertex.label.cex=0.8,
+       edge.curved=curve.vec[as.factor(E(net.path)$GI.type)], 
+       vertex.frame.color=node.col, 
+       edge.color=edge.col.cor[as.factor(E(net.path)$GI.type)], 
+       edge.width=(abs(E(net.path)$PROP)+0.0001)*5,
+       vertex.color=adjustcolor(node.col,0.05), 
+       edge.label.color="black",
+       edge.label.cex=1,
+       layout=l)
+```
+
+###################################################################################################
+#### BETWEEN PATHWAY INTERACTION ENRICHMENT, P VALUE BY BOOTSTRAPPING
+###################################################################################################
+
+### 1. FROM proportion of genetic interaction in the network,
+### 2. USE Monte Carlo simmulation, to
+### 3. GET probabilities of observed proportion of interactions .
+
+```{r}
+#DETERMINE PROBABILITY OF EACH GENETIC INTERACTION TYPE
+  GI.type.prop<-as.numeric(prop.table(table(GI.df$GI.type)))
+  GI.type.prop<-c(GI.type.prop[1:2], sum(GI.type.prop[3:4]))
+  GI.type.vec<-c("NEGATIVE", "NON-INTERACTIVE","POSITIVE")
+  DF<-GI.df[,colnames(GI.df) %in% c("NODE1", "PATHWAY1", "NODE2", "PATHWAY2")]
+  x<-as.data.frame(INT.p)
+
+#POSITIVE INTERACTIONS BETWEEN,
+  #CHR.SEG and DNA
+    vec<-c("CHR.SEG", "DNA")
+    CHR.SEG.DNA<-replicate(10000,{
+    samp<-sample(GI.type.vec,nrow(DF),prob =  GI.type.prop, replace = TRUE)
+    perm.DF<-cbind.data.frame(DF, samp)
+    sub.DF<-perm.DF[perm.DF$PATHWAY1 %in% vec & perm.DF$PATHWAY2 %in% vec,]
+    sub.DF<-sub.DF[sub.DF$PATHWAY1!=sub.DF$PATHWAY2,]
+    prop.table(table(sub.DF$samp=="POSITIVE"))[2]
+    })
+  #Probability of greater than 23% positive interactions
+  paste(vec[1],vec[2], "P_<", length(which(CHR.SEG.DNA>=x$Freq[x$Var2 == "POSITIVE" & x$Var1=="CHR.SEG_DNA"]))/length(CHR.SEG.DNA), sep = "_")
+
+  #CHR.SEG and RIBOSOME
+    vec<-c("CHR.SEG", "RIBOSOME")
+    CHR.SEG.RIBO<-replicate(10000,{
+    samp<-sample(GI.type.vec,nrow(DF),prob =  GI.type.prop, replace = TRUE)
+    perm.DF<-cbind.data.frame(DF, samp)
+    sub.DF<-perm.DF[perm.DF$PATHWAY1 %in% vec & perm.DF$PATHWAY2 %in% vec,]
+    sub.DF<-sub.DF[sub.DF$PATHWAY1!=sub.DF$PATHWAY2,]
+    prop.table(table(sub.DF$samp=="POSITIVE"))[2]
+    })
+    #Probability of greater than 23% positive interactions
+    paste(vec[1],vec[2], "P_<", length(which(CHR.SEG.RIBO>=x$Freq[x$Var2 == "POSITIVE" & x$Var1=="CHR.SEG_RIBOSOME"]))/length(CHR.SEG.RIBO), sep = "_")
+
+#NEGATIVE INTERACTIONS BETWEEN,
+  #MRNA and ER
+    vec5<-c("MRNA PROCESSING", "ER")
+    MRNA.ER<-replicate(10000,{
+    samp<-sample(GI.type.vec,nrow(DF), prob =  GI.type.prop,replace = TRUE)
+    perm.DF<-cbind.data.frame(DF, samp)
+    sub.DF<-perm.DF[perm.DF$PATHWAY1 %in% vec5 & perm.DF$PATHWAY2 %in% vec5,]
+    sub.DF<-sub.DF[sub.DF$PATHWAY1!=sub.DF$PATHWAY2,]
+    prop.table(table(sub.DF$samp=="NEGATIVE"))[2]
+    })
+    #Probability of greater than 30% positive interactions
+    paste(vec5[1],vec5[2], "P_<", length(which(MRNA.ER>=x$Freq[x$Var2 == "NEGATIVE" & x$Var1=="ER_MRNA PROCESSING"]))/length(MRNA.ER),sep = "_")
+
+  #ER and CHR.SEG
+    vec6<-c("CHR.SEG", "ER")
+    CHR.SEG.ER<-replicate(10000,{
+    samp<-sample(GI.type.vec,nrow(DF), prob =  GI.type.prop,replace = TRUE)
+    perm.DF<-cbind.data.frame(DF, samp)
+    sub.DF<-perm.DF[perm.DF$PATHWAY1 %in% vec6 & perm.DF$PATHWAY2 %in% vec6,]
+    sub.DF<-sub.DF[sub.DF$PATHWAY1!=sub.DF$PATHWAY2,]
+    prop.table(table(sub.DF$samp=="NEGATIVE"))[2]
+    })
+    #Probability of greater than 47% positive interactions
+    paste(vec6[1],vec6[2], "P_<", length(which(CHR.SEG.ER>=x$Freq[x$Var2 == "NEGATIVE" & x$Var1=="CHR.SEG_ER"]))/length(CHR.SEG.ER),sep = "_")
+
+  #ER and DNA
+    vec3<-c("ER", "DNA")
+    ER.DNA<-replicate(10000,{
+    samp<-sample(GI.type.vec,nrow(DF), prob =  GI.type.prop,replace = TRUE)
+    perm.DF<-cbind.data.frame(DF, samp)
+    sub.DF<-perm.DF[perm.DF$PATHWAY1 %in% vec3 & perm.DF$PATHWAY2 %in% vec3,]
+    sub.DF<-sub.DF[sub.DF$PATHWAY1!=sub.DF$PATHWAY2,]
+    prop.table(table(sub.DF$samp=="NEGATIVE"))[2]
+    })
+    #Probability of greater than 20% positive interactions
+    paste(vec3[1],vec3[2], "P_<", length(which(ER.DNA>=x$Freq[x$Var2 == "NEGATIVE" & x$Var1=="DNA_ER"]))/length(ER.DNA),sep = "_")
+
+  #MRNA PROCESSING and DNA
+    vec3<-c("MRNA PROCESSING", "DNA")
+    MRNA.DNA<-replicate(10000,{
+    samp<-sample(GI.type.vec,nrow(DF), prob =  GI.type.prop,replace = TRUE)
+    perm.DF<-cbind.data.frame(DF, samp)
+    sub.DF<-perm.DF[perm.DF$PATHWAY1 %in% vec3 & perm.DF$PATHWAY2 %in% vec3,]
+    sub.DF<-sub.DF[sub.DF$PATHWAY1!=sub.DF$PATHWAY2,]
+    prop.table(table(sub.DF$samp=="NEGATIVE"))[2]
+    })
+    #Probability of greater than 20% positive interactions
+    paste(vec3[1],vec3[2], "P_<", length(which(MRNA.DNA>=x$Freq[x$Var2 == "NEGATIVE" & x$Var1=="DNA_MRNA PROCESSING"]))/length(MRNA.DNA),sep = "_")
+```
